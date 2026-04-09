@@ -1,4 +1,5 @@
-# Terrarium
+<img width="1280" height="720" alt="New Project (10)" src="https://github.com/user-attachments/assets/8e00ef7f-e4c1-4f7a-a6da-c89f2ed57acc" />
+
 
 A tool for recording and watching [fishtank.live](https://fishtank.live) streams locally.
 

@@ -6,7 +6,7 @@ A tool for recording and watching [fishtank.live](https://fishtank.live) streams
 > **You need your own Fishtank account with a valid Season Pass. This does not bypass any paywalls.**
 
 ---
-
+<sub><sup>If anyone on the ft team has issues with this, just email me and we can get it figured out. jwfeniello@gmail.com</sup></sub> 
 ## What it does
 
 - Record any camera (or all of them at once) to disk in 6-hour chunks

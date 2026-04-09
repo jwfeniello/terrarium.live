@@ -1,6 +1,6 @@
 # Terrarium
 
-A tool for recording and watching [Fishtank LIVE](https://fishtank.live) streams locally.
+A tool for recording and watching [fishtank.live](https://fishtank.live) streams locally.
 
 > **You need your own Fishtank account with a valid Season Pass. This does not bypass any paywalls.**
 

@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
 Terrarium — Fishtank LIVE Tool
-Requires: pip install requests  |  ffmpeg in PATH
+Requires: pip install requests curl-cffi msgpack  |  ffmpeg in PATH
 """
 
 import os, sys, time, subprocess, requests, urllib.parse, json, getpass
-import threading, socket
+import threading, socket, ssl
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+try:
+    from curl_cffi import requests as cf_requests
+    from curl_cffi import CurlWsFlag
+    import msgpack
+    HAS_WS = True
+except ImportError:
+    HAS_WS = False
 
 # ═══════════════════════════════════════════════════════════════════
 # CAMERAS
@@ -180,6 +188,244 @@ def get_stream_url(cam_code):
     return result[0]
 
 
+# ── Cache ─────────────────────────────────────────────────────────
+
+snap_cache = {}
+url_cache  = {}
+cache_lock = threading.Lock()
+
+
+def warm_cache(selected_cams):
+    def _warm():
+        for name, cam_code in selected_cams:
+            url = get_stream_url(cam_code)
+            if url:
+                with cache_lock:
+                    url_cache[cam_code] = url
+        for name, cam_code in selected_cams:
+            _refresh_snap(name, cam_code)
+    threading.Thread(target=_warm, daemon=True).start()
+
+
+def _refresh_snap(name, cam_code):
+    with cache_lock:
+        url = url_cache.get(cam_code)
+    if not url:
+        url = get_stream_url(cam_code)
+        if not url:
+            return
+        with cache_lock:
+            url_cache[cam_code] = url
+    try:
+        cmd = ["ffmpeg", "-y", "-i", url, "-vframes", "1",
+               "-f", "image2", "-vcodec", "mjpeg", "pipe:1"]
+        result = subprocess.run(cmd, capture_output=True, timeout=10)
+        if result.returncode == 0 and result.stdout:
+            with cache_lock:
+                snap_cache[name] = result.stdout
+    except Exception:
+        pass
+
+
+def snap_refresh_loop(selected_cams):
+    while not stop_event.is_set():
+        for name, cam_code in selected_cams:
+            if stop_event.is_set():
+                break
+            _refresh_snap(name, cam_code)
+        stop_event.wait(10)
+
+
+def get_cached_stream_url(cam_code):
+    with cache_lock:
+        url = url_cache.get(cam_code)
+    if url:
+        return url
+    url = get_stream_url(cam_code)
+    if url:
+        with cache_lock:
+            url_cache[cam_code] = url
+    return url
+
+
+# ── Chat ──────────────────────────────────────────────────────────
+
+chat_messages = []
+chat_lock     = threading.Lock()
+chat_seen_ids = set()
+MAX_MESSAGES  = 500
+chat_sockets  = {}  # room_name -> ws reference
+chat_sockets_lock = threading.Lock()
+
+
+CHAT_ROOMS = ["Global", "Season Pass"]
+
+
+def _pack_sio(type_id, data):
+    return msgpack.packb(
+        {"type": type_id, "data": data, "nsp": "/"},
+        use_bin_type=True,
+    )
+
+
+def _handle_binary(data, ws, room_name=None):
+    """Decode msgpack binary frame(s) and process them."""
+    # Try stripping possible Engine.IO prefix bytes
+    for skip in range(min(4, len(data))):
+        try:
+            unpacker = msgpack.Unpacker(raw=False, strict_map_key=False)
+            unpacker.feed(data[skip:])
+            decoded_any = False
+            for m in unpacker:
+                if isinstance(m, dict) and "type" in m:
+                    decoded_any = True
+                    _process_sio_packet(m, ws, room_name)
+                elif isinstance(m, list) and len(m) > 0 and isinstance(m[0], dict) and "type" in m[0]:
+                    decoded_any = True
+                    _process_sio_packet(m[0], ws, room_name)
+            if decoded_any:
+                return
+        except Exception:
+            continue
+    preview = data[:60].hex() if data else "(empty)"
+    print(f"  [WS] undecoded frame ({len(data)}b): {preview}")
+
+
+def _process_sio_packet(m, ws, room_name):
+    """Handle a single decoded Socket.IO packet."""
+
+    typ     = m.get("type")
+    payload = m.get("data")
+
+    # type 0: auth response — server sends {sid, pid}, handshake complete
+    if typ == 0 and isinstance(payload, dict):
+        sid = payload.get("sid")
+        pid = payload.get("pid")
+        if sid and pid:
+            tag = f" [{room_name}]" if room_name else ""
+            print(f"  [WS]{tag} authenticated (sid={sid[:8]}…)")
+            # If this is a room socket, subscribe to the room
+            if room_name and room_name != "Global":
+                ws.send(_pack_sio(2, ["chat:room", room_name]), CurlWsFlag.BINARY)
+                print(f"  [WS]{tag} subscribed to room")
+
+    # type 2: events — chat:message, tts:*, sfx:*, etc.
+    elif typ == 2 and isinstance(payload, list) and len(payload) >= 2:
+        event      = payload[0]
+        event_data = payload[1]
+        msgs = event_data if isinstance(event_data, list) else [event_data]
+
+        if event == "chat:message":
+            for p in msgs:
+                if not isinstance(p, dict):
+                    continue
+                user = p.get("user", {})
+                cm = {
+                    "id":       str(p.get("id", "")),
+                    "text":     str(p.get("message", "")),
+                    "username": str(user.get("displayName", "unknown")),
+                    "color":    str(user.get("customUsernameColor") or "#ffffff"),
+                    "isAdmin":  bool(p.get("admin", False)),
+                    "isMod":    bool((p.get("metadata") or {}).get("isMod", False)),
+                    "room":     room_name or "Global",
+                }
+                if cm["text"]:
+                    with chat_lock:
+                        if cm["id"] not in chat_seen_ids:
+                            chat_seen_ids.add(cm["id"])
+                            chat_messages.append(cm)
+                            if len(chat_messages) > MAX_MESSAGES:
+                                removed = chat_messages.pop(0)
+                                chat_seen_ids.discard(removed["id"])
+
+
+def chat_connect(bearer, room_name=None):
+    """
+    Connect to Fishtank chat via curl-cffi (bypasses Cloudflare TLS
+    fingerprinting) using explicit recv() calls.
+    If room_name is set, subscribes to that room after auth.
+    """
+    ws_url = "wss://ws.fishtank.live/socket.io/?EIO=4&transport=websocket"
+    tag = f" [{room_name}]" if room_name else ""
+
+    sess = cf_requests.Session(impersonate="chrome120")
+    ws = sess.ws_connect(
+        ws_url,
+        headers={
+            "Origin": "https://classic.fishtank.live",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        },
+    )
+    print(f"  [WS]{tag} connected")
+
+    with chat_sockets_lock:
+        chat_sockets[room_name or "Global"] = ws
+
+    while not stop_event.is_set():
+        try:
+            data, flags = ws.recv()
+        except Exception as e:
+            print(f"  [WS]{tag} recv error: {e}")
+            break
+
+        is_text   = (flags & CurlWsFlag.TEXT) != 0
+        is_binary = (flags & CurlWsFlag.BINARY) != 0
+
+        if is_text:
+            text = data.decode("utf-8") if isinstance(data, bytes) else data
+            if text.startswith("0"):
+                print(f"  [WS]{tag} handshake, authenticating...")
+                ws.send(_pack_sio(0, {"token": bearer}), CurlWsFlag.BINARY)
+            elif text == "2":
+                ws.send(b"3", CurlWsFlag.TEXT)
+            continue
+
+        if is_binary and data:
+            _handle_binary(data, ws, room_name)
+
+
+def start_chat(bearer):
+    if not HAS_WS:
+        print("  ! Chat disabled — run: pip install curl-cffi msgpack")
+        return
+
+    for room in CHAT_ROOMS:
+        def _loop(r=room):
+            while not stop_event.is_set():
+                try:
+                    chat_connect(bearer, room_name=r)
+                except Exception as e:
+                    print(f"  [WS] [{r}] error: {e}")
+                with chat_sockets_lock:
+                    chat_sockets.pop(r, None)
+                if not stop_event.is_set():
+                    print(f"  [WS] [{r}] disconnected, retrying in 5s...")
+                    stop_event.wait(5)
+
+        threading.Thread(target=_loop, daemon=True).start()
+
+    print(f"  ✓ Chat connecting ({', '.join(CHAT_ROOMS)})...")
+
+
+def send_chat_message(text, room="Global"):
+    """Send a chat message through the appropriate websocket."""
+    with chat_sockets_lock:
+        ws = chat_sockets.get(room)
+    if not ws:
+        print(f"  [WS] no socket for room: {room}")
+        return False
+    try:
+        ws.send(_pack_sio(2, ["chat:message", {"message": text}]), CurlWsFlag.BINARY)
+        return True
+    except Exception as e:
+        print(f"  [WS] send error: {e}")
+        return False
+
+
 # ── Recording ─────────────────────────────────────────────────────
 
 def start_recording(name, cam_code, save_dir, chunk_hours):
@@ -189,6 +435,7 @@ def start_recording(name, cam_code, save_dir, chunk_hours):
         print(f"  ✗ {name} — offline/unreachable")
         return None
     pattern = os.path.join(save_dir, f"{name}_%Y-%m-%d_%H-%M-%S.ts")
+    log_path = os.path.join(save_dir, f"{name}.log")
     cmd = [
         "ffmpeg", "-y",
         "-reconnect",          "1",
@@ -203,8 +450,13 @@ def start_recording(name, cam_code, save_dir, chunk_hours):
         "-strftime",           "1",
         pattern,
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    print(f"  ✓ {name} -> {save_dir}")
+    log_file = open(log_path, "w")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=log_file,
+    )
+    print(f"  ✓ {name} -> {save_dir}  (log: {name}.log)")
     return proc
 
 
@@ -244,7 +496,6 @@ def token_refresh_loop(selected_cams, save_dir, chunk_hours, do_record):
             break
         try:
             refresh_tokens()
-            # Clear URL cache so fresh JWT gets used
             with cache_lock:
                 url_cache.clear()
             if do_record:
@@ -253,78 +504,7 @@ def token_refresh_loop(selected_cams, save_dir, chunk_hours, do_record):
             print(f"[{ts()}] Token refresh error: {e}")
 
 
-# ── Snapshot + stream URL cache ───────────────────────────────────
-
-snap_cache    = {}   # name -> bytes
-url_cache     = {}   # cam_code -> url
-cache_lock    = threading.Lock()
-
-
-def warm_cache(selected_cams):
-    """Pre-fetch stream URLs and snapshots for all cams in background."""
-    def _warm():
-        # First pass: get all stream URLs fast
-        for name, cam_code in selected_cams:
-            url = get_stream_url(cam_code)
-            if url:
-                with cache_lock:
-                    url_cache[cam_code] = url
-
-        # Second pass: grab snapshots using cached URLs
-        for name, cam_code in selected_cams:
-            _refresh_snap(name, cam_code)
-
-    threading.Thread(target=_warm, daemon=True).start()
-
-
-def _refresh_snap(name, cam_code):
-    with cache_lock:
-        url = url_cache.get(cam_code)
-    if not url:
-        url = get_stream_url(cam_code)
-        if not url:
-            return
-        with cache_lock:
-            url_cache[cam_code] = url
-    try:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", url,
-            "-vframes", "1",
-            "-f", "image2",
-            "-vcodec", "mjpeg",
-            "pipe:1"
-        ]
-        result = subprocess.run(cmd, capture_output=True, timeout=10)
-        if result.returncode == 0 and result.stdout:
-            with cache_lock:
-                snap_cache[name] = result.stdout
-    except Exception:
-        pass
-
-
-def snap_refresh_loop(selected_cams):
-    """Refresh all snapshots every 10 seconds."""
-    while not stop_event.is_set():
-        for name, cam_code in selected_cams:
-            if stop_event.is_set():
-                break
-            _refresh_snap(name, cam_code)
-        stop_event.wait(10)
-
-
-def get_cached_stream_url(cam_code):
-    with cache_lock:
-        url = url_cache.get(cam_code)
-    if url:
-        return url
-    url = get_stream_url(cam_code)
-    if url:
-        with cache_lock:
-            url_cache[cam_code] = url
-    return url
-
-
+# ── Network ───────────────────────────────────────────────────────
 
 def get_local_ip():
     try:
@@ -342,8 +522,11 @@ def get_local_ip():
 def build_site(selected_cams, port):
     ip = get_local_ip()
     cam_list = [
-        {"name": name, "stream": f"http://{ip}:{port}/cam/{urllib.parse.quote(name)}",
-         "snap": f"http://{ip}:{port}/snap/{urllib.parse.quote(name)}"}
+        {
+            "name":   name,
+            "stream": f"http://{ip}:{port}/cam/{urllib.parse.quote(name)}",
+            "snap":   f"http://{ip}:{port}/snap/{urllib.parse.quote(name)}",
+        }
         for name, _ in selected_cams
     ]
     cam_json = json.dumps(cam_list)
@@ -356,155 +539,328 @@ def build_site(selected_cams, port):
 <title>Terrarium — Fishtank LIVE</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.4.12/dist/hls.min.js"></script>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: #0a0a0c;
-    color: #e0e0e0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    min-height: 100vh;
-  }
-  header {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 14px 20px;
-    background: #111114;
-    border-bottom: 1px solid #222;
-    position: sticky;
-    top: 0;
-    z-index: 100;
-  }
-  header h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
-  header .sub { font-size: 12px; color: #555; }
-  header .count { font-size: 13px; color: #555; margin-left: auto; }
-
-  #grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: 10px;
-    padding: 16px;
-  }
-  .cam-card {
-    background: #111114;
-    border: 1px solid #1e1e22;
-    border-radius: 10px;
-    overflow: hidden;
-    cursor: pointer;
-    transition: border-color 0.15s, transform 0.15s;
-  }
-  .cam-card:hover { border-color: #5865f2; transform: scale(1.015); }
-  .cam-card img {
-    width: 100%;
-    aspect-ratio: 16/9;
-    background: #0a0a0c;
-    display: block;
-    object-fit: cover;
-  }
-  .cam-card .label {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 12px;
-    font-size: 13px;
-    font-weight: 600;
-  }
-  .dot {
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    background: #22c55e;
-  }
-  .dot.off { background: #333; }
-
-  #overlay {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: #000;
-    z-index: 200;
-    flex-direction: column;
-  }
-  #overlay.open { display: flex; }
-  #overlay-bar {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 12px 16px;
-    background: rgba(0,0,0,0.7);
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    z-index: 10;
-    opacity: 0;
-    transition: opacity 0.2s;
-  }
-  #overlay:hover #overlay-bar { opacity: 1; }
-  #overlay-title { font-size: 16px; font-weight: 700; }
-  #overlay-close {
-    margin-left: auto;
-    background: rgba(255,255,255,0.1);
-    border: none; color: #fff;
-    padding: 6px 14px;
-    border-radius: 6px;
-    cursor: pointer; font-size: 13px;
-  }
-  #overlay-close:hover { background: rgba(255,255,255,0.2); }
-  #overlay video { width: 100%; height: 100%; object-fit: contain; }
-  #cam-bar {
-    position: absolute;
-    bottom: 0; left: 0; right: 0;
-    display: flex;
-    gap: 6px;
-    padding: 10px 14px;
-    background: rgba(0,0,0,0.7);
-    overflow-x: auto;
-    scrollbar-width: none;
-    opacity: 0;
-    transition: opacity 0.2s;
-    z-index: 10;
-  }
-  #overlay:hover #cam-bar { opacity: 1; }
-  .pill {
-    flex-shrink: 0;
-    background: rgba(255,255,255,0.1);
-    border: 1px solid rgba(255,255,255,0.15);
-    border-radius: 20px;
-    padding: 5px 12px;
-    font-size: 12px;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background 0.1s;
-    color: #fff;
-  }
-  .pill:hover, .pill.active { background: #5865f2; border-color: #5865f2; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #0a0a0c;
+  color: #e0e0e0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  background: #111114;
+  border-bottom: 1px solid #222;
+  flex-shrink: 0;
+}
+header h1 { font-size: 16px; font-weight: 700; }
+header .sub { font-size: 11px; color: #555; }
+header .count { font-size: 12px; color: #555; margin-left: auto; }
+#main { display: flex; flex: 1; overflow: hidden; }
+#content { flex: 1; overflow-y: auto; }
+#grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+  padding: 14px;
+}
+.cam-card {
+  background: #111114;
+  border: 1px solid #1e1e22;
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.15s;
+}
+.cam-card:hover { border-color: #5865f2; transform: scale(1.015); }
+.cam-card img {
+  width: 100%;
+  aspect-ratio: 16/9;
+  background: #0a0a0c;
+  display: block;
+  object-fit: cover;
+}
+.cam-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; }
+.dot.off { background: #333; }
+#chat-sidebar {
+  width: 290px;
+  flex-shrink: 0;
+  background: #0e0e10;
+  border-left: 1px solid #1e1e22;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#chat-head {
+  padding: 0;
+  font-size: 12px;
+  font-weight: 700;
+  border-bottom: 1px solid #1e1e22;
+  display: flex;
+  align-items: stretch;
+  flex-shrink: 0;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #555;
+}
+.chat-tab {
+  flex: 1;
+  padding: 9px 6px;
+  text-align: center;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.chat-tab:hover { color: #aaa; }
+.chat-tab.active { color: #e0e0e0; border-bottom-color: #5865f2; }
+.chat-btn {
+  background: none;
+  border: none;
+  color: #555;
+  cursor: pointer;
+  padding: 0 8px;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  transition: color 0.15s;
+  flex-shrink: 0;
+}
+.chat-btn:hover { color: #e0e0e0; }
+#chat-msgs {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a2e transparent;
+}
+.msg {
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.msg:hover { background: rgba(255,255,255,0.04); }
+.msg-name { font-weight: 700; margin-right: 4px; }
+.msg-text { color: #bbb; font-weight: 300; }
+.msg-room { font-size: 9px; color: #555; background: #1a1a1e; border-radius: 3px; padding: 1px 4px; margin-right: 4px; vertical-align: middle; }
+.chat-input-wrap {
+  display: flex;
+  padding: 6px 8px;
+  border-top: 1px solid #1e1e22;
+  flex-shrink: 0;
+  gap: 6px;
+}
+.chat-input-wrap input {
+  flex: 1;
+  background: #1a1a1e;
+  border: 1px solid #2a2a2e;
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: #e0e0e0;
+  font-size: 12px;
+  outline: none;
+}
+.chat-input-wrap input:focus { border-color: #5865f2; }
+.chat-input-wrap button {
+  background: #5865f2;
+  border: none;
+  color: #fff;
+  border-radius: 6px;
+  padding: 0 12px;
+  font-size: 16px;
+  cursor: pointer;
+  font-weight: 700;
+}
+.chat-input-wrap button:hover { background: #4752c4; }
+#overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: #000;
+  z-index: 200;
+}
+#overlay.open { display: flex; }
+#overlay-main { flex: 1; position: relative; display: flex; flex-direction: column; }
+#overlay-bar {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: rgba(0,0,0,0.7);
+  z-index: 10;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+#overlay-main:hover #overlay-bar { opacity: 1; }
+#overlay-title { font-size: 15px; font-weight: 700; }
+#overlay-chat-toggle {
+  background: rgba(255,255,255,0.1);
+  border: none; color: #fff;
+  padding: 5px 14px;
+  border-radius: 6px;
+  cursor: pointer; font-size: 12px;
+}
+#overlay-chat-toggle:hover { background: rgba(255,255,255,0.2); }
+#overlay-close {
+  margin-left: auto;
+  background: rgba(255,255,255,0.1);
+  border: none; color: #fff;
+  padding: 5px 14px;
+  border-radius: 6px;
+  cursor: pointer; font-size: 13px;
+}
+#overlay-close:hover { background: rgba(255,255,255,0.2); }
+#overlay video { flex: 1; width: 100%; object-fit: contain; }
+#cam-bar {
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  display: flex;
+  gap: 6px;
+  padding: 10px 14px;
+  background: rgba(0,0,0,0.7);
+  overflow-x: auto;
+  scrollbar-width: none;
+  z-index: 10;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+#overlay-main:hover #cam-bar { opacity: 1; }
+#overlay-chat {
+  width: 300px;
+  background: #0e0e10;
+  border-left: 1px solid #1e1e22;
+  display: none;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+#overlay-chat.show { display: flex; }
+#overlay-chat-head {
+  padding: 0;
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid #1e1e22;
+  flex-shrink: 0;
+}
+#overlay-chat-head .chat-tab {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #555;
+}
+#overlay-chat-msgs {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a2e transparent;
+}
+.pill {
+  flex-shrink: 0;
+  background: rgba(255,255,255,0.1);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 20px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  color: #fff;
+  transition: background 0.1s;
+}
+.pill:hover, .pill.active { background: #5865f2; border-color: #5865f2; }
 </style>
 </head>
 <body>
-
 <header>
   <h1>Terrarium</h1>
   <span class="sub">Fishtank LIVE</span>
   <span class="count" id="count"></span>
 </header>
-
-<div id="grid"></div>
-
-<div id="overlay">
-  <div id="overlay-bar">
-    <span id="overlay-title"></span>
-    <button id="overlay-close">✕ Close</button>
+<div id="main">
+  <div id="content">
+    <div id="grid"></div>
   </div>
-  <video id="overlay-video" autoplay playsinline controls></video>
-  <div id="cam-bar"></div>
+  <div id="chat-sidebar">
+    <div id="chat-head">
+      <div class="chat-tab active" data-room="All">All</div>
+      <div class="chat-tab" data-room="Global">Global</div>
+      <div class="chat-tab" data-room="Season Pass">Season Pass</div>
+      <button class="chat-btn" id="chat-popout" title="Pop out chat">⧉</button>
+    </div>
+    <div id="chat-msgs"></div>
+    <div class="chat-input-wrap">
+      <input type="text" id="chat-input" placeholder="Send a message..." autocomplete="off">
+      <button id="chat-send">›</button>
+    </div>
+  </div>
 </div>
-
+<div id="overlay">
+  <div id="overlay-main">
+    <div id="overlay-bar">
+      <span id="overlay-title"></span>
+      <button id="overlay-chat-toggle">💬 Chat</button>
+      <button id="overlay-close">✕ Close</button>
+    </div>
+    <video id="overlay-video" autoplay playsinline controls></video>
+    <div id="cam-bar"></div>
+  </div>
+  <div id="overlay-chat">
+    <div id="overlay-chat-head">
+      <div class="chat-tab active" data-room="All">All</div>
+      <div class="chat-tab" data-room="Global">Global</div>
+      <div class="chat-tab" data-room="Season Pass">SP</div>
+    </div>
+    <div id="overlay-chat-msgs"></div>
+    <div class="chat-input-wrap">
+      <input type="text" id="overlay-chat-input" placeholder="Send a message..." autocomplete="off">
+      <button id="overlay-chat-send">›</button>
+    </div>
+  </div>
+</div>
 <script>
 const CAMS = """ + cam_json + """;
 let activeHls = null;
 let activeIdx = null;
+let chatPopout = null;
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 
 function loadSnap(img, snapUrl) {
   const tmp = new Image();
-  tmp.onload = () => { img.src = tmp.src; img.closest('.cam-card').querySelector('.dot').classList.remove('off'); };
-  tmp.onerror = () => { img.closest('.cam-card').querySelector('.dot').classList.add('off'); };
+  tmp.onload = () => {
+    img.src = tmp.src;
+    img.closest('.cam-card').querySelector('.dot').classList.remove('off');
+  };
+  tmp.onerror = () => {
+    img.closest('.cam-card').querySelector('.dot').classList.add('off');
+  };
   tmp.src = snapUrl + '?t=' + Date.now();
 }
 
@@ -514,7 +870,7 @@ function openCam(idx) {
   document.getElementById('overlay-title').textContent = cam.name;
   document.getElementById('overlay').classList.add('open');
   document.body.style.overflow = 'hidden';
-  document.querySelectorAll('.pill').forEach((p, i) => p.classList.toggle('active', i === idx));
+  document.querySelectorAll('#cam-bar .pill').forEach((p, i) => p.classList.toggle('active', i === idx));
   const video = document.getElementById('overlay-video');
   if (activeHls) { activeHls.destroy(); activeHls = null; }
   if (Hls.isSupported()) {
@@ -526,6 +882,7 @@ function openCam(idx) {
     video.src = cam.stream;
     video.play().catch(() => {});
   }
+  syncOverlayChat();
 }
 
 function closeCam() {
@@ -543,14 +900,15 @@ document.getElementById('count').textContent = CAMS.length + ' cameras';
 CAMS.forEach((cam, idx) => {
   const card = document.createElement('div');
   card.className = 'cam-card';
-  card.innerHTML = '<img alt="' + cam.name + '"><div class="label"><span>' + cam.name + '</span><span class="dot off"></span></div>';
+  card.innerHTML =
+    '<img alt="' + esc(cam.name) + '">' +
+    '<div class="cam-label"><span>' + esc(cam.name) + '</span>' +
+    '<span class="dot off"></span></div>';
   card.addEventListener('click', () => openCam(idx));
   grid.appendChild(card);
-
   const img = card.querySelector('img');
   loadSnap(img, cam.snap);
   setInterval(() => loadSnap(img, cam.snap), 10000);
-
   const pill = document.createElement('button');
   pill.className = 'pill';
   pill.textContent = cam.name;
@@ -564,6 +922,243 @@ document.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft'  && activeIdx !== null) openCam((activeIdx - 1 + CAMS.length) % CAMS.length);
 });
 document.getElementById('overlay-close').addEventListener('click', closeCam);
+
+// ── Chat state ──────────────────────────────────────────────────
+const allMessages = [];
+const seenIds = new Set();
+let sidebarRoom = 'All';
+let overlayRoom = 'All';
+
+const chatEl = document.getElementById('chat-msgs');
+const overlayChatEl = document.getElementById('overlay-chat-msgs');
+
+// Sidebar tabs
+document.querySelectorAll('#chat-head .chat-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('#chat-head .chat-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    sidebarRoom = tab.dataset.room;
+    renderTo(chatEl, sidebarRoom);
+  });
+});
+
+// Overlay tabs
+document.querySelectorAll('#overlay-chat-head .chat-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('#overlay-chat-head .chat-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    overlayRoom = tab.dataset.room;
+    renderTo(overlayChatEl, overlayRoom);
+  });
+});
+
+// Overlay chat toggle
+document.getElementById('overlay-chat-toggle').addEventListener('click', () => {
+  const panel = document.getElementById('overlay-chat');
+  panel.classList.toggle('show');
+  if (panel.classList.contains('show')) syncOverlayChat();
+});
+
+function syncOverlayChat() {
+  renderTo(overlayChatEl, overlayRoom);
+}
+
+function renderTo(el, room) {
+  el.innerHTML = '';
+  const filtered = room === 'All' ? allMessages : allMessages.filter(m => m.room === room);
+  filtered.forEach(m => el.appendChild(makeMsgDiv(m, room)));
+  el.scrollTop = el.scrollHeight;
+}
+
+function makeMsgDiv(m, roomFilter) {
+  const div = document.createElement('div');
+  div.className = 'msg';
+  div.innerHTML =
+    (roomFilter === 'All' && m.room && m.room !== 'Global' ? '<span class="msg-room">' + esc(m.room) + '</span>' : '') +
+    '<span class="msg-name" style="color:' + esc(m.color) + '">' + esc(m.username) + '</span>' +
+    '<span class="msg-text">' + esc(m.text) + '</span>';
+  return div;
+}
+
+function appendToEl(el, m, roomFilter) {
+  if (roomFilter !== 'All' && m.room !== roomFilter) return;
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  el.appendChild(makeMsgDiv(m, roomFilter));
+  while (el.children.length > 200) el.removeChild(el.firstChild);
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+function appendMsg(m) {
+  if (seenIds.has(m.id)) return;
+  seenIds.add(m.id);
+  allMessages.push(m);
+  while (allMessages.length > 200) {
+    const removed = allMessages.shift();
+    seenIds.delete(removed.id);
+  }
+  // Sidebar
+  appendToEl(chatEl, m, sidebarRoom);
+  // Overlay (if open)
+  if (document.getElementById('overlay-chat').classList.contains('show')) {
+    appendToEl(overlayChatEl, m, overlayRoom);
+  }
+  // Popout
+  if (chatPopout && !chatPopout.closed) {
+    try { chatPopout.appendMsg(m); } catch {}
+  }
+}
+
+// ── Pop-out chat ────────────────────────────────────────────────
+document.getElementById('chat-popout').addEventListener('click', () => {
+  if (chatPopout && !chatPopout.closed) { chatPopout.focus(); return; }
+  chatPopout = window.open('', 'terrarium_chat', 'width=340,height=600');
+  const doc = chatPopout.document;
+  doc.write(`<!DOCTYPE html><html><head><title>Chat</title><style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0e0e10; color: #e0e0e0; font-family: -apple-system, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+    #tabs { display: flex; border-bottom: 1px solid #1e1e22; flex-shrink: 0; }
+    .tab { flex: 1; padding: 8px; text-align: center; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: #555; cursor: pointer; border-bottom: 2px solid transparent; }
+    .tab:hover { color: #aaa; }
+    .tab.active { color: #e0e0e0; border-bottom-color: #5865f2; }
+    #msgs { flex: 1; overflow-y: auto; padding: 6px 4px; display: flex; flex-direction: column; gap: 1px; scrollbar-width: thin; scrollbar-color: #2a2a2e transparent; }
+    .msg { padding: 3px 10px; border-radius: 4px; font-size: 12px; line-height: 1.5; word-break: break-word; }
+    .msg:hover { background: rgba(255,255,255,0.04); }
+    .msg-name { font-weight: 700; margin-right: 4px; }
+    .msg-text { color: #bbb; font-weight: 300; }
+    .msg-room { font-size: 9px; color: #555; background: #1a1a1e; border-radius: 3px; padding: 1px 4px; margin-right: 4px; }
+    .input-wrap { display: flex; padding: 6px 8px; border-top: 1px solid #1e1e22; gap: 6px; }
+    .input-wrap input { flex: 1; background: #1a1a1e; border: 1px solid #2a2a2e; border-radius: 6px; padding: 6px 10px; color: #e0e0e0; font-size: 12px; outline: none; }
+    .input-wrap input:focus { border-color: #5865f2; }
+    .input-wrap button { background: #5865f2; border: none; color: #fff; border-radius: 6px; padding: 0 12px; font-size: 16px; cursor: pointer; font-weight: 700; }
+  </style></head><body>
+    <div id="tabs">
+      <div class="tab active" data-room="All">All</div>
+      <div class="tab" data-room="Global">Global</div>
+      <div class="tab" data-room="Season Pass">Season Pass</div>
+    </div>
+    <div id="msgs"></div>
+    <div class="input-wrap">
+      <input type="text" id="pop-input" placeholder="Send a message..." autocomplete="off">
+      <button id="pop-send">›</button>
+    </div>
+  </body></html>`);
+  doc.close();
+
+  const popMsgs = chatPopout.document.getElementById('msgs');
+  let popRoom = 'All';
+
+  function esc2(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function renderPop() {
+    popMsgs.innerHTML = '';
+    const filtered = popRoom === 'All' ? allMessages : allMessages.filter(m => m.room === popRoom);
+    filtered.forEach(m => {
+      const div = doc.createElement('div');
+      div.className = 'msg';
+      div.innerHTML =
+        (popRoom === 'All' && m.room && m.room !== 'Global' ? '<span class="msg-room">' + esc2(m.room) + '</span>' : '') +
+        '<span class="msg-name" style="color:' + esc2(m.color) + '">' + esc2(m.username) + '</span>' +
+        '<span class="msg-text">' + esc2(m.text) + '</span>';
+      popMsgs.appendChild(div);
+    });
+    popMsgs.scrollTop = popMsgs.scrollHeight;
+  }
+
+  chatPopout.document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      chatPopout.document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      popRoom = tab.dataset.room;
+      renderPop();
+    });
+  });
+
+  chatPopout.appendMsg = function(m) {
+    if (popRoom !== 'All' && m.room !== popRoom) return;
+    const atBottom = popMsgs.scrollHeight - popMsgs.scrollTop - popMsgs.clientHeight < 80;
+    const div = doc.createElement('div');
+    div.className = 'msg';
+    div.innerHTML =
+      (popRoom === 'All' && m.room && m.room !== 'Global' ? '<span class="msg-room">' + esc2(m.room) + '</span>' : '') +
+      '<span class="msg-name" style="color:' + esc2(m.color) + '">' + esc2(m.username) + '</span>' +
+      '<span class="msg-text">' + esc2(m.text) + '</span>';
+    popMsgs.appendChild(div);
+    while (popMsgs.children.length > 200) popMsgs.removeChild(popMsgs.firstChild);
+    if (atBottom) popMsgs.scrollTop = popMsgs.scrollHeight;
+  };
+
+  renderPop();
+
+  // Wire popout send
+  const popInput = doc.getElementById('pop-input');
+  const popBtn = doc.getElementById('pop-send');
+  popBtn.addEventListener('click', () => {
+    sendMessage(popInput.value, popRoom === 'All' ? 'Global' : popRoom);
+    popInput.value = '';
+    popInput.focus();
+  });
+  popInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage(popInput.value, popRoom === 'All' ? 'Global' : popRoom);
+      popInput.value = '';
+    }
+  });
+});
+
+// ── Send messages ───────────────────────────────────────────────
+async function sendMessage(text, room) {
+  if (!text.trim()) return;
+  try {
+    await fetch('/chat/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text.trim(), room: room }),
+    });
+  } catch (e) { console.error('Send failed:', e); }
+}
+
+function wireInput(inputEl, btnEl, roomFn) {
+  btnEl.addEventListener('click', () => {
+    sendMessage(inputEl.value, roomFn());
+    inputEl.value = '';
+    inputEl.focus();
+  });
+  inputEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage(inputEl.value, roomFn());
+      inputEl.value = '';
+    }
+  });
+}
+
+wireInput(
+  document.getElementById('chat-input'),
+  document.getElementById('chat-send'),
+  () => sidebarRoom === 'All' ? 'Global' : sidebarRoom
+);
+
+wireInput(
+  document.getElementById('overlay-chat-input'),
+  document.getElementById('overlay-chat-send'),
+  () => overlayRoom === 'All' ? 'Global' : overlayRoom
+);
+
+let chatCursor = 0;
+
+async function pollChat() {
+  try {
+    const r = await fetch('/chat?since=' + chatCursor);
+    if (r.ok) {
+      const data = await r.json();
+      data.msgs.forEach(appendMsg);
+      chatCursor = data.total;
+    }
+  } catch {}
+  setTimeout(pollChat, 200);
+}
+pollChat();
 </script>
 </body>
 </html>"""
@@ -603,6 +1198,26 @@ def make_handler(selected_cams, port):
                 self._text(200, b"ok")
                 return
 
+            if path == "chat":
+                # Support ?since=N to only return messages after index N
+                since = 0
+                if "?" in self.path:
+                    qs = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+                    try: since = int(qs.get("since", [0])[0])
+                    except: pass
+                with chat_lock:
+                    msgs = list(chat_messages[since:])
+                    total = len(chat_messages)
+                body = json.dumps({"msgs": msgs, "total": total}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if path in ("playlist.m3u", "playlist"):
                 body = build_playlist(selected_cams, port).encode()
                 self.send_response(200)
@@ -626,7 +1241,7 @@ def make_handler(selected_cams, port):
                     self.end_headers()
                     self.wfile.write(body)
                 else:
-                    self._text(503, b"Snapshot not ready yet")
+                    self._text(503, b"Snapshot not ready")
                 return
 
             if path.startswith("cam/"):
@@ -635,26 +1250,24 @@ def make_handler(selected_cams, port):
                 if not code:
                     self._text(404, f"Unknown camera: {name}".encode())
                     return
-                url = get_cached_stream_url(code)
-                if not url:
+                stream_url = get_cached_stream_url(code)
+                if not stream_url:
                     self._text(503, b"Camera offline")
                     return
                 try:
-                    # Proxy the m3u8 playlist, rewriting segment URLs to
-                    # go through us so the token stays fresh
-                    r = requests.get(url, timeout=8)
+                    r = requests.get(stream_url, timeout=8)
                     if r.status_code != 200:
                         self._text(503, b"Stream unavailable")
                         return
-                    ip = get_local_ip()
-                    base = f"http://{ip}:{port}/seg/{urllib.parse.quote(name)}/"
-                    lines = []
+                    ip       = get_local_ip()
+                    prx_base = f"http://{ip}:{port}/seg/{urllib.parse.quote(name)}/"
+                    lines    = []
                     for line in r.text.splitlines():
-                        if line.startswith("#") or not line.strip():
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith("#"):
                             lines.append(line)
                         else:
-                            # Rewrite relative segment URLs to go through proxy
-                            lines.append(base + urllib.parse.quote(line, safe=""))
+                            lines.append(prx_base + urllib.parse.quote(stripped, safe=""))
                     body = "\n".join(lines).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/vnd.apple.mpegurl")
@@ -671,7 +1284,7 @@ def make_handler(selected_cams, port):
                 rest  = path[4:]
                 slash = rest.index("/")
                 name  = urllib.parse.unquote(rest[:slash])
-                seg   = urllib.parse.unquote(rest[slash+1:])
+                seg   = urllib.parse.unquote(rest[slash + 1:])
                 code  = cam_map.get(name)
                 if not code:
                     self._text(404, b"Unknown camera")
@@ -680,15 +1293,12 @@ def make_handler(selected_cams, port):
                 if not stream_url:
                     self._text(503, b"Camera offline")
                     return
-                # Resolve seg relative to the master playlist directory
                 master_base = stream_url.rsplit("/", 1)[0] + "/"
                 seg_url     = master_base + seg
                 try:
                     r = requests.get(seg_url, timeout=15, stream=True)
                     ct = r.headers.get("Content-Type", "")
-
                     if "mpegurl" in ct or seg.split("?")[0].endswith(".m3u8"):
-                        # Use THIS playlist's base so relative .ts URLs resolve correctly
                         this_base = seg_url.split("?")[0].rsplit("/", 1)[0] + "/"
                         ip        = get_local_ip()
                         prx_base  = f"http://{ip}:{port}/seg/{urllib.parse.quote(name)}/"
@@ -698,9 +1308,7 @@ def make_handler(selected_cams, port):
                             if not stripped or stripped.startswith("#"):
                                 lines.append(line)
                             else:
-                                # Build full Fishtank URL then encode it for our proxy
                                 full = this_base + stripped if not stripped.startswith("http") else stripped
-                                # Strip master_base prefix to get a path relative to master
                                 rel  = full[len(master_base):] if full.startswith(master_base) else full
                                 lines.append(prx_base + urllib.parse.quote(rel, safe=""))
                         body = "\n".join(lines).encode()
@@ -712,8 +1320,6 @@ def make_handler(selected_cams, port):
                         self.end_headers()
                         self.wfile.write(body)
                     else:
-                        # Raw .ts segment — stream straight through
-                        # seg_url already correctly resolved above
                         self.send_response(200)
                         self.send_header("Content-Type", "video/mp2t")
                         self.send_header("Access-Control-Allow-Origin", "*")
@@ -734,13 +1340,47 @@ def make_handler(selected_cams, port):
 
             self._text(404, b"Not found")
 
-        def _text(self, code, body):
-            self.send_response(code)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
+        def do_POST(self):
+            path = self.path.strip("/").split("?")[0]
+
+            if path == "chat/send":
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                try:
+                    data = json.loads(body)
+                    text = data.get("message", "").strip()
+                    room = data.get("room", "Global")
+                    if not text:
+                        self._text(400, b"Empty message")
+                        return
+                    ok = send_chat_message(text, room)
+                    if ok:
+                        self._text(200, b"sent")
+                    else:
+                        self._text(503, b"No socket for room")
+                except Exception as e:
+                    self._text(500, f"Error: {e}".encode())
+                return
+
+            self._text(404, b"Not found")
+
+        def do_OPTIONS(self):
+            self.send_response(200)
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
-            self.wfile.write(body)
+
+        def _text(self, code, body):
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+            except (ConnectionAbortedError, BrokenPipeError):
+                pass
 
     return Handler
 
@@ -749,10 +1389,9 @@ def start_proxy(selected_cams, port):
     handler = make_handler(selected_cams, port)
     srv = HTTPServer(("0.0.0.0", port), handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    # Warm cache immediately in background
     warm_cache(selected_cams)
-    # Keep refreshing snapshots every 10s
     threading.Thread(target=lambda: snap_refresh_loop(selected_cams), daemon=True).start()
+    start_chat(access_token)
     ip = get_local_ip()
     print(f"  ✓ Web viewer   -> http://{ip}:{port}")
     print(f"  ✓ Playlist URL -> http://{ip}:{port}/playlist.m3u")
@@ -821,7 +1460,6 @@ if __name__ == "__main__":
 
     print_header()
 
-    # ── Login ────────────────────────────────────────────────────
     print("  Login\n")
     saved_email, saved_password = load_credentials()
 
@@ -848,7 +1486,6 @@ if __name__ == "__main__":
         clear_credentials()
         sys.exit(1)
 
-    # ── Mode ─────────────────────────────────────────────────────
     print()
     divider("─")
     print("  Mode\n")
@@ -865,7 +1502,6 @@ if __name__ == "__main__":
     do_proxy  = mode in ("1", "3")
     do_record = mode in ("2", "3")
 
-    # ── Camera selection ─────────────────────────────────────────
     print()
     divider("─")
     print("  Camera Selection\n")
@@ -877,7 +1513,6 @@ if __name__ == "__main__":
 
     print(f"  Selected: {', '.join(n for n, _ in selected_cams)}\n")
 
-    # ── Options ──────────────────────────────────────────────────
     save_dir    = None
     chunk_hours = 6
     proxy_port  = 8888
@@ -893,7 +1528,6 @@ if __name__ == "__main__":
         print("  Proxy Options\n")
         proxy_port = pick_proxy_port()
 
-    # ── Start ────────────────────────────────────────────────────
     print()
     divider()
 

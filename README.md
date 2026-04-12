@@ -59,3 +59,14 @@ The same URL works as an IPTV source on smart TVs, Plex, TiviMate, etc.
 - Recordings are saved as `.ts` files and split into chunks (default 6 hours)
 - If a camera goes offline, the watchdog will restart it automatically when it comes back
 - Credentials are stored in `~/.terrarium_session` as plain text
+
+
+
+
+
+## Screenshots
+
+<img width="1902" height="851" alt="image" src="https://github.com/user-attachments/assets/5c61f8aa-e489-42c6-823f-67f406fd09f1" />
+
+
+

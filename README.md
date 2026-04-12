@@ -7,23 +7,26 @@ A tool for recording and watching [fishtank.live](https://fishtank.live) streams
 
 ---
 <sub><sup>If anyone on the ft team has issues with this, just email me and we can get it figured out. jwfeniello@gmail.com</sup></sub> 
+
 ## What it does
 
 - Record any camera (or all of them at once) to disk in 6-hour chunks
 - Self-host a local web viewer — works in any browser, smart TV, or IPTV app
 - Generate an M3U playlist you can load into VLC, Plex, or anything that supports it
 - Tokens refresh automatically so recordings don't stop after 30 minutes
-
+- Built-in live chat in the web viewer, interfacing with the official site
 ---
 
 ## Requirements
 
 - Python 3.10+
+- curl-cffi
+- msgpack
 - [ffmpeg](https://ffmpeg.org/download.html) in your PATH
 - A Fishtank account with Season Pass
 
 ```bash
-pip install requests
+pip install requests curl-cffi msgpack
 ```
 
 ---

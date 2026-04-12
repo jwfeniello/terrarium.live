@@ -51,9 +51,16 @@ You can record all cameras at once or pick specific ones by number.
 
 ## Web viewer
 
-When running in mode 1 or 3, open the URL printed in the terminal in any browser on your network. Thumbnails update every 10 seconds and clicking a camera opens it fullscreen. Arrow keys switch between cameras.
+When running in mode 1 or 3, open the URL printed in the terminal in any browser on your network. The server binds to your local IP, so it works on any device on the same network.
 
-The same URL works as an IPTV source on smart TVs, Plex, TiviMate, etc.
+Thumbnails update every 10 seconds, and clicking a camera opens it fullscreen.
+
+Arrow keys switch between cameras
+ESC closes the player
+
+The web viewer includes live chat synced with the official site.
+
+The same URL can also be used as an IPTV source in smart TVs, Plex, TiviMate, etc (video only, no chat).
 
 ---
 

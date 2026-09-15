@@ -19,15 +19,21 @@ A tool for recording and watching [fishtank.live](https://fishtank.live) streams
 
 ## Requirements
 
-- Python 3.10+
-- curl-cffi
-- msgpack
+- Python 3.9+
+- Python packages in `requirements.txt`
 - [ffmpeg](https://ffmpeg.org/download.html) in your PATH
 - A Fishtank account with Season Pass
 
 ```bash
-pip install requests curl-cffi msgpack
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
+
+The tool asks for your Fishtank email and password on first run. Your Season
+Pass is checked by Fishtank when the stream token is issued; this tool does not
+bypass the paywall. The camera list and current season are loaded from the
+Fishtank API automatically.
 
 ---
 
@@ -82,5 +88,4 @@ The same URL can also be used as an IPTV source in smart TVs, Plex, TiviMate, et
 
 <img width="1902" height="851" alt="image" src="https://github.com/user-attachments/assets/5c61f8aa-e489-42c6-823f-67f406fd09f1" />
 <img width="1913" height="870" alt="s" src="https://github.com/user-attachments/assets/026364e4-501b-4d09-8fa3-0f0a2095efc0" />
-
 

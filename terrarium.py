@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Terrarium — Fishtank LIVE Tool
-Requires: pip install requests curl-cffi msgpack  |  ffmpeg in PATH
+Requires: pip install -r requirements.txt  |  ffmpeg in PATH
 """
 
 import os, sys, time, subprocess, requests, urllib.parse, json, getpass
@@ -43,10 +43,16 @@ CAMERAS = {
     "19": ("Jungle Room",  "br4j"),
 }
 
-SEASON       = 5
-SERVERS      = list("abcdefghi")
+SEASON       = 5  # Legacy fallback only; current streams are discovered from the API.
+SERVERS      = list("abcdefghi")  # Legacy fallback only.
 SESSION_FILE = os.path.join(os.path.expanduser("~"), ".terrarium_session")
 CHAT_ROOMS   = ["Global", "Season Pass"]
+
+# Current Fishtank stream metadata is returned by /v1/live-streams.  These
+# values are populated after login and keep the old hard-coded camera table as
+# a fallback for older API deployments.
+stream_servers = {}
+current_stream_ids = set()
 
 # Base64-encoded JPEG thumbnail for offline/broken cameras
 # Generate: ffmpeg -i broken.png -vf scale=320:180 -q:v 8 broken_thumb.jpg
@@ -144,19 +150,47 @@ def login(email, password):
     )
     resp.raise_for_status()
     data = resp.json()
-    s = data["session"]
-    access_token      = s["access_token"]
-    refresh_token_val = s["refresh_token"]
-    live_stream_token = s["live_stream_token"]
-    session.headers["authorization"] = f"Bearer {access_token}"
-    user_display_name = data.get("user", {}).get("displayName")
+    s = data.get("session") or {}
+
+    # Older API responses returned bearer and stream tokens directly.  The
+    # current site uses an HttpOnly session cookie and issues the stream token
+    # from /live-streams/token, so keep the cookie and only add Authorization
+    # when the legacy fields are present.
+    access_token      = s.get("access_token")
+    refresh_token_val = s.get("refresh_token")
+    live_stream_token = s.get("live_stream_token") or s.get("liveStreamToken")
+    if access_token:
+        session.headers["authorization"] = f"Bearer {access_token}"
+    else:
+        session.headers.pop("authorization", None)
+
+    user = data.get("user") or s.get("user") or {}
+    user_display_name = user.get("displayName")
+
+    try:
+        current = session.get("https://api.fishtank.live/v1/auth", timeout=10)
+        if current.ok:
+            current_session = (current.json() or {}).get("session") or {}
+            current_user = current_session.get("user") or {}
+            user_display_name = user_display_name or current_user.get("displayName")
+            access_token = access_token or current_session.get("access_token")
+            refresh_token_val = refresh_token_val or current_session.get("refresh_token")
+            live_stream_token = live_stream_token or current_session.get("live_stream_token")
+            if access_token:
+                session.headers["authorization"] = f"Bearer {access_token}"
+    except Exception:
+        pass
+
+    if not live_stream_token:
+        refresh_live_stream_token()
+
     if not user_display_name:
         try:
-            uid = data.get("user", {}).get("id") or s.get("user_id")
+            uid = user.get("id") or s.get("user_id")
             if uid:
                 pr = session.get(f"https://api.fishtank.live/v1/profile/{uid}", timeout=10)
                 if pr.ok:
-                    user_display_name = pr.json().get("displayName")
+                    user_display_name = (pr.json().get("profile") or pr.json()).get("displayName")
         except Exception:
             pass
     if user_display_name:
@@ -168,46 +202,77 @@ def login(email, password):
 def refresh_tokens():
     global access_token, refresh_token_val, live_stream_token
     try:
-        resp = session.post(
-            "https://api.fishtank.live/v1/auth/refresh",
-            json={"refresh_token": refresh_token_val},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        s = resp.json()["session"]
-        access_token      = s["access_token"]
-        refresh_token_val = s["refresh_token"]
-        live_stream_token = s["live_stream_token"]
-        session.headers["authorization"] = f"Bearer {access_token}"
+        refresh_live_stream_token()
+        if refresh_token_val:
+            resp = session.post(
+                "https://api.fishtank.live/v1/auth/refresh",
+                json={"refresh_token": refresh_token_val},
+                timeout=15,
+            )
+            if resp.ok:
+                s = (resp.json() or {}).get("session") or {}
+                access_token      = s.get("access_token") or access_token
+                refresh_token_val = s.get("refresh_token") or refresh_token_val
+                live_stream_token = (
+                    s.get("live_stream_token") or s.get("liveStreamToken") or live_stream_token
+                )
+                if access_token:
+                    session.headers["authorization"] = f"Bearer {access_token}"
         print(f"[{ts()}] Tokens refreshed OK")
     except Exception:
         print(f"[{ts()}] Refresh failed — re-logging in...")
         login(user_email, user_password)
 
 
+def refresh_live_stream_token():
+    """Get the current stream JWT using the site's cookie session."""
+    global live_stream_token
+    resp = session.get(
+        "https://api.fishtank.live/v1/live-streams/token",
+        timeout=15,
+    )
+    resp.raise_for_status()
+    live_stream_token = (resp.json() or {}).get("liveStreamToken")
+    if not live_stream_token:
+        raise RuntimeError("Fishtank did not return a live stream token")
+
+
 # ── Stream URL ────────────────────────────────────────────────────
 
 def get_stream_url(cam_code):
+    global current_stream_ids
     result = [None]
     found  = threading.Event()
 
-    def try_server(letter):
+    # Current API stream IDs are the path after /hls/.  The old tool passed
+    # short camera codes and used /hls/live+<code>-5/; retain that fallback.
+    current_id = cam_code in current_stream_ids
+    if current_id:
+        server = stream_servers.get(cam_code, "streams-f.fishtank.live")
+        servers = [server]
+    else:
+        servers = [f"streams-{letter}.fishtank.live" for letter in SERVERS]
+
+    def try_server(server):
         if found.is_set():
             return
-        url = (
-            f"https://streams-{letter}.fishtank.live"
-            f"/hls/live+{cam_code}-{SEASON}/index.m3u8"
-            f"?jwt={live_stream_token}&video=maxbps"
-        )
+        if current_id:
+            url = f"https://{server}/hls/live+{cam_code}/index.m3u8"
+        else:
+            url = f"https://{server}/hls/live+{cam_code}-{SEASON}/index.m3u8"
+        params = {"video": "maxbps"}
+        if live_stream_token:
+            params["jwt"] = live_stream_token
+        url += "?" + urllib.parse.urlencode(params)
         try:
-            r = requests.head(url, timeout=3)
+            r = session.head(url, timeout=5)
             if r.status_code == 200 and not found.is_set():
                 result[0] = url
                 found.set()
         except requests.RequestException:
             pass
 
-    threads = [threading.Thread(target=try_server, args=(l,), daemon=True) for l in SERVERS]
+    threads = [threading.Thread(target=try_server, args=(server,), daemon=True) for server in servers]
     for t in threads:
         t.start()
     found.wait(timeout=5)
@@ -596,6 +661,28 @@ def get_local_ip():
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def fetch_cameras():
+    """Load the current camera list and stream server map from Fishtank."""
+    global stream_servers, current_stream_ids
+    try:
+        resp = session.get("https://api.fishtank.live/v1/live-streams", timeout=15)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        streams = data.get("liveStreams") or []
+        stream_servers = data.get("loadBalancer") or {}
+        current_stream_ids = {str(item["id"]) for item in streams if item.get("id")}
+        cameras = [
+            (str(item.get("name") or item.get("id")), str(item["id"]))
+            for item in streams
+            if item.get("id") and not item.get("hidden")
+        ]
+        if cameras:
+            return cameras
+    except Exception as exc:
+        print(f"  ! Could not load current cameras ({exc}); using legacy camera list")
+    return list(CAMERAS.values())
 
 
 # ── Web viewer ────────────────────────────────────────────────────
@@ -1978,10 +2065,10 @@ def start_proxy(selected_cams, port):
 
 # ── UI helpers ────────────────────────────────────────────────────
 
-def pick_cameras():
+def pick_cameras(cameras):
     print("  Available cameras:\n")
-    for num, (name, code) in CAMERAS.items():
-        print(f"    [{num:>2}] {name}")
+    for index, (name, _stream_id) in enumerate(cameras, 1):
+        print(f"    [{index:>2}] {name}")
     print()
     print("  Enter camera numbers separated by commas,")
     print("  or press Enter for ALL cameras:")
@@ -1992,11 +2079,14 @@ def pick_cameras():
         return list(CAMERAS.values())
     selected = []
     for part in raw.split(","):
-        key = part.strip()
-        if key in CAMERAS:
-            selected.append(CAMERAS[key])
+        try:
+            index = int(part.strip())
+        except ValueError:
+            index = 0
+        if 1 <= index <= len(cameras):
+            selected.append(cameras[index - 1])
         else:
-            print(f"  ! Unknown number: {key} — skipping")
+            print(f"  ! Unknown number: {part.strip()} — skipping")
     return selected
 
 
@@ -2087,7 +2177,7 @@ if __name__ == "__main__":
     print()
     divider("─")
     print("  Camera Selection\n")
-    selected_cams = pick_cameras()
+    selected_cams = pick_cameras(fetch_cameras())
 
     if not selected_cams:
         print("  No cameras selected — exiting.")
